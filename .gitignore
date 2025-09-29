@@ -1,0 +1,4 @@
+.env/
+history.db
+api.py
+watch-history.json
