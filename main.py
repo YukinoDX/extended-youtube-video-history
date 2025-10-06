@@ -199,6 +199,22 @@ def scores_match(rows, query: str):
     return scores[0]
 
 
+def to_json(rows, colors):
+    return [
+        {
+            "id_video": row["id_video"],
+            "title": row["title"],
+            "channel": row["channel"],
+            "id_channel": row["id_channel"],
+            "category": row["category"],
+            "time_watch": row["time_watch"],
+            "thumbnail_url": row["thumbnail_url"],
+            "color": color,
+        }
+        for row, color in zip(rows, colors)
+    ]
+
+
 @app.route("/search-word", methods=["GET"])
 def search_word():
     query = request.args.get("content", "")
@@ -212,12 +228,7 @@ def search_word():
         rows = [rows[id] for id in ids]
         colors = [colors[id] for id in ids]
 
-    return render_template(
-        "index.html",
-        mode="word",
-        rows_colors=zip(rows, colors),
-        categories=categories,
-    )
+    return to_json(rows, colors)
 
 
 @app.route("/search-filter", methods=["GET"])
@@ -257,25 +268,12 @@ def search_filter():
     rows = query_db(sql, params)
     colors = [to_color_code(row["category"]) for row in rows]
 
-    return render_template(
-        "index.html",
-        mode="filter",
-        rows_colors=zip(rows, colors),
-        categories=categories,
-    )
+    return to_json(rows, colors)
 
 
 @app.route("/", methods=["GET"])
 def index():
-    rows = query_db("SELECT * FROM history")  # 前計算できる
-    colors = [to_color_code(row["category"]) for row in rows]  # 前計算できる
-
-    return render_template(
-        "index.html",
-        mode="filter",
-        rows_colors=zip(rows, colors),
-        categories=categories,
-    )
+    return render_template("index.html")
 
 
 if __name__ == "__main__":
