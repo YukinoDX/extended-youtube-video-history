@@ -1,11 +1,17 @@
+# upload
+import sys
 import json
 from urllib.parse import parse_qs, urlparse
-import sqlite3
-from itertools import count
 from datetime import datetime
+import sqlite3
+from sqlite3 import Cursor
 import googleapiclient.discovery
-from sentence_transformers import SentenceTransformer, util
 from api import API_KEY
+
+# search,UI
+from sentence_transformers import SentenceTransformer, util
+from flask import Flask, request, render_template, g
+import colorsys
 
 # カテゴリID → カテゴリの名前
 category_map = {
@@ -25,6 +31,7 @@ category_map = {
     "26": "Howto & Style",
     "27": "Education",
     "28": "Science & Technology",
+    "29": "Nonprofits & Activism",
     "30": "Movies",
     "31": "Anime/Animation",
     "32": "Action/Adventure",
@@ -46,65 +53,104 @@ nums_category = {category: num for num, category in enumerate(category_map.value
 categories = [category for category in category_map.values()] + ["All"]
 
 
-def add_to_db():
+def add_to_db(cur: Cursor, ids: list[str], times: list[str]):
+    youtube = googleapiclient.discovery.build("youtube", "v3", developerKey=API_KEY)
+
+    video_response = (
+        youtube.videos().list(part="snippet", id=",".join(set(ids))).execute()
+    )
+
+    for item in video_response["items"]:
+        if "id" not in item:
+            sys.exit(f"not exist id. item: {item}")
+        if "snippet" not in item:
+            sys.exit(f'not exist snippet. id: {item["id"]}')
+        if "title" not in item["snippet"]:
+            sys.exit(f'not exist title. id: {item["id"]}')
+        if "channelTitle" not in item["snippet"]:
+            sys.exit(f'not exist channelTitle. id: {item["id"]}')
+        if "channelId" not in item["snippet"]:
+            sys.exit(f'not exist channelId. id: {item["id"]}')
+        if "categoryId" not in item["snippet"]:
+            sys.exit(f'not exist categoryId. id: {item["id"]}')
+        if "thumbnails" not in item["snippet"]:
+            sys.exit(f'not exist thumbnails. id: {item["id"]}')
+        if item["snippet"]["categoryId"] not in category_map:
+            sys.exit(f'not exist categoryId. id: {item["id"]}')
+
+    # idに重複があると、len(ids) != len(video_response) なので、id → snippetの mapを先に作る
+    id_snippets = {item["id"]: item["snippet"] for item in video_response["items"]}
+
+    assert len(ids) == len(times)
+    for id, time in zip(ids, times):
+        if id not in id_snippets:  # 非公開や削除された動画は返ってこない
+            continue
+
+        snippet = id_snippets[id]
+        cur.execute(
+            """
+            INSERT INTO history (
+                title,
+                id_video,
+                channel,
+                id_channel,
+                category,
+                time_watch,
+                thumbnail_url
+            ) VALUES (?,?,?,?,?,?,?)
+        """,
+            (
+                snippet["title"],
+                id,
+                snippet["channelTitle"],
+                snippet["channelId"],
+                category_map[snippet["categoryId"]],
+                datetime.fromisoformat(time.replace("Z", "+00:00")).strftime(
+                    "%Y/%m/%d"
+                ),
+                snippet["thumbnails"]["high"]["url"],
+            ),
+        )
+
+
+def upload_takeout():
+    loop = 0
     with open("watch-history.json") as f:
         conn = sqlite3.connect("history.db")
         cur = conn.cursor()
 
         hists = json.load(f)
         ids, times = [], []
-        for i in count():
+        for hist in hists:
             if (
-                "視聴しました" not in hists[i]["title"]
-                or hists[i]["header"] != "YouTube"
-            ):
+                "視聴しました" not in hist["title"]
+                or hist["header"] != "YouTube"
+                or "details" in hist
+            ):  # details in → 広告の動画
                 continue
 
-            url_parsed = urlparse(hists[i]["titleUrl"])
-            id_video = parse_qs(url_parsed.query).get("v")[0]
+            url_parsed = urlparse(hist["titleUrl"])
+            v_parsed = parse_qs(url_parsed.query).get("v")
+            if v_parsed is None:
+                continue
+
+            id_video = v_parsed[0]
             ids.append(id_video)
-            times.append(hists[i]["time"])
-            if len(ids) >= 50:
-                break
+            times.append(hist["time"])
+            if len(ids) < 50:
+                continue
+            add_to_db(cur, ids, times)
+            ids, times = [], []
 
-        youtube = googleapiclient.discovery.build("youtube", "v3", developerKey=API_KEY)
-
-        video_response = (
-            youtube.videos().list(part="snippet", id=",".join(ids)).execute()
-        )
-        for i in range(50):
-            snippet = video_response["items"][i]["snippet"]
-            cur.execute(
-                """
-                INSERT INTO history (
-                    title,
-                    id_video,
-                    channel,
-                    id_channel,
-                    category,
-                    time_watch,
-                    thumbnail_url
-                ) VALUES (?,?,?,?,?,?,?)
-            """,
-                (
-                    snippet["title"],
-                    ids[i],
-                    snippet["channelTitle"],
-                    snippet["channelId"],
-                    category_map[snippet["categoryId"]],
-                    datetime.fromisoformat(times[i].replace("Z", "+00:00")).strftime(
-                        "%Y/%m/%d"
-                    ),
-                    snippet["thumbnails"]["high"]["url"],
-                ),
-            )
+            loop += 1
+            print(f"upload {50*loop} videos")
+        if ids:
+            add_to_db(cur, ids, times)
+            print(f"upload {50*loop+len(ids)} videos")
 
         conn.commit()
         conn.close()
 
-
-from flask import Flask, request, render_template, g
-import colorsys
 
 app = Flask(__name__)
 
@@ -143,7 +189,7 @@ def scores_match(rows, query: str):
     model = SentenceTransformer(
         "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2", device="cpu"
     )
-    titles = [row["title"] for row in rows] # 最初から変わらない. 前計算できる
+    titles = [row["title"] for row in rows]  # 最初から変わらない. 前計算できる
 
     embeddings = model.encode(titles, convert_to_tensor=True)
     query_emb = model.encode(query, convert_to_tensor=True)
@@ -157,8 +203,8 @@ def scores_match(rows, query: str):
 def search_word():
     query = request.args.get("content", "")
 
-    rows = query_db("SELECT * FROM history") # 前計算できる
-    colors = [to_color_code(row["category"]) for row in rows] # 前計算できる
+    rows = query_db("SELECT * FROM history")  # 前計算できる
+    colors = [to_color_code(row["category"]) for row in rows]  # 前計算できる
 
     if query:
         scores = scores_match(rows, query)
@@ -221,8 +267,8 @@ def search_filter():
 
 @app.route("/", methods=["GET"])
 def index():
-    rows = query_db("SELECT * FROM history") # 前計算できる
-    colors = [to_color_code(row["category"]) for row in rows] # 前計算できる
+    rows = query_db("SELECT * FROM history")  # 前計算できる
+    colors = [to_color_code(row["category"]) for row in rows]  # 前計算できる
 
     return render_template(
         "index.html",
@@ -234,3 +280,4 @@ def index():
 
 if __name__ == "__main__":
     app.run(port=8080, debug=True)
+    # upload_takeout()
